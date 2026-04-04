@@ -19,6 +19,7 @@ import base64
 import io
 import os
 import tempfile
+import traceback
 from threading import Lock
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
@@ -265,6 +266,7 @@ async def translate_text(req: TranslateRequest):
     try:
         translated = model.translate(req.text, target_lang=target_code, source_lang=source_code)
     except Exception as e:
+        print(f"Translation error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
     return TranslateResponse(translated=translated, from_lang=source, to_lang=target)
