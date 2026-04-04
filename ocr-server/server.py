@@ -34,7 +34,6 @@ import edge_tts
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
-from paddleocr import PaddleOCR
 from PIL import Image
 from pydantic import BaseModel
 
@@ -65,6 +64,8 @@ def _get_ocr_model():
     if _ocr_model is None:
         with _ocr_lock:
             if _ocr_model is None:
+                from paddleocr import PaddleOCR
+
                 print("Loading PaddleOCR model...")
                 _ocr_model = PaddleOCR(use_angle_cls=_use_angle_cls, lang="en", show_log=False)
                 print("PaddleOCR model loaded.")
