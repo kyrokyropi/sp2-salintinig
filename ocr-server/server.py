@@ -255,12 +255,17 @@ async def translate_text(req: TranslateRequest):
         raise HTTPException(status_code=503, detail=str(e))
 
     source = req.source_lang.strip() or _detect_lang(req.text)
-    # Normalise: only 'en' and 'tl' supported
+    # Normalise: only 'en' and 'tl' supported (display names)
     source = "tl" if source in ("tl", "fil") else "en"
     target = "en" if source == "tl" else "tl"
 
+    # opus-mt uses "fil" for Filipino/Tagalog, not "tl"
+    _to_opus = lambda lang: "fil" if lang == "tl" else lang
+    source_code = _to_opus(source)
+    target_code = _to_opus(target)
+
     try:
-        translated = model.translate(req.text, target_lang=target, source_lang=source)
+        translated = model.translate(req.text, target_lang=target_code, source_lang=source_code)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
