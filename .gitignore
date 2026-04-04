@@ -1,0 +1,5 @@
+.expo/
+ocr-server/venv/
+ocr-server/__pycache__/
+**/__pycache__/
+*.pyc

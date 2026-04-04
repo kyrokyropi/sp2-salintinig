@@ -1,0 +1,14 @@
+fastapi
+uvicorn[standard]
+paddleocr==2.10.0
+paddlepaddle==2.6.2
+Pillow
+numpy
+setuptools
+# edge-tts – Microsoft neural voices, Python 3.12 compatible, no API key needed
+edge-tts
+# Translation
+easynmt
+langdetect
+nltk
+symspellpy
