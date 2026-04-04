@@ -259,10 +259,8 @@ async def translate_text(req: TranslateRequest):
     source = "tl" if source in ("tl", "fil") else "en"
     target = "en" if source == "tl" else "tl"
 
-    # opus-mt uses "fil" for Filipino/Tagalog, not "tl"
-    _to_opus = lambda lang: "fil" if lang == "tl" else lang
-    source_code = _to_opus(source)
-    target_code = _to_opus(target)
+    source_code = source
+    target_code = target
 
     try:
         translated = model.translate(req.text, target_lang=target_code, source_lang=source_code)
