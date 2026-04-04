@@ -19,12 +19,16 @@ import base64
 import io
 import os
 import tempfile
+from threading import Lock
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 import nltk
-nltk.download("punkt_tab", quiet=True)
-nltk.download("punkt", quiet=True)
+
+# Avoid network/download work during module import on small PaaS instances.
+if os.getenv("NLTK_DOWNLOAD_ON_STARTUP", "0") == "1":
+    nltk.download("punkt_tab", quiet=True)
+    nltk.download("punkt", quiet=True)
 
 import edge_tts
 from fastapi import FastAPI, HTTPException
@@ -50,18 +54,42 @@ app.add_middleware(
 )
 
 # ── OCR model ────────────────────────────────────────────────────────────────
-# Load model once at startup (downloads ~10 MB on first run, cached after)
-ocr = PaddleOCR(use_angle_cls=True, lang="en", show_log=False)
+# Lazy-load OCR so the web service can bind a port quickly on Render.
+_ocr_model = None
+_ocr_lock = Lock()
+_use_angle_cls = os.getenv("PADDLE_USE_ANGLE_CLS", "0") == "1"
+
+
+def _get_ocr_model():
+    global _ocr_model
+    if _ocr_model is None:
+        with _ocr_lock:
+            if _ocr_model is None:
+                print("Loading PaddleOCR model...")
+                _ocr_model = PaddleOCR(use_angle_cls=_use_angle_cls, lang="en", show_log=False)
+                print("PaddleOCR model loaded.")
+    return _ocr_model
 
 # ── EasyNMT translation model ─────────────────────────────────────────────────
-print("Loading EasyNMT translation model…")
-try:
-    from easynmt import EasyNMT
-    nmt_model = EasyNMT("opus-mt")
-    print("EasyNMT model loaded.")
-except Exception as _e:
-    print(f"Warning: could not load EasyNMT: {_e}")
-    nmt_model = None
+# EasyNMT is memory-heavy; keep it optional and lazy-loaded.
+_enable_easynmt = os.getenv("ENABLE_EASYNMT", "0") == "1"
+nmt_model = None
+_nmt_lock = Lock()
+
+
+def _get_nmt_model():
+    global nmt_model
+    if not _enable_easynmt:
+        raise RuntimeError("Translation disabled on this deployment")
+    if nmt_model is None:
+        with _nmt_lock:
+            if nmt_model is None:
+                from easynmt import EasyNMT
+
+                print("Loading EasyNMT translation model...")
+                nmt_model = EasyNMT("opus-mt")
+                print("EasyNMT model loaded.")
+    return nmt_model
 
 # ── Spell correction (symspellpy) ────────────────────────────────────────────
 try:
@@ -145,9 +173,10 @@ async def run_ocr(req: OCRRequest):
     # PaddleOCR 2.x works with numpy arrays directly
     import numpy as np
     img_np = np.array(img)
+    ocr_model = _get_ocr_model()
 
     try:
-        results = ocr.ocr(img_np, cls=True)
+        results = ocr_model.ocr(img_np, cls=_use_angle_cls)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
 
@@ -219,8 +248,10 @@ class TranslateResponse(BaseModel):
 async def translate_text(req: TranslateRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text is empty")
-    if nmt_model is None:
-        raise HTTPException(status_code=503, detail="Translation model not available")
+    try:
+        model = _get_nmt_model()
+    except Exception as e:
+        raise HTTPException(status_code=503, detail=str(e))
 
     source = req.source_lang.strip() or _detect_lang(req.text)
     # Normalise: only 'en' and 'tl' supported
@@ -228,7 +259,7 @@ async def translate_text(req: TranslateRequest):
     target = "en" if source == "tl" else "tl"
 
     try:
-        translated = nmt_model.translate(req.text, target_lang=target, source_lang=source)
+        translated = model.translate(req.text, target_lang=target, source_lang=source)
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
 
