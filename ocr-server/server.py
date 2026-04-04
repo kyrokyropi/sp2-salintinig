@@ -26,10 +26,8 @@ os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
 import nltk
 
-# Avoid network/download work during module import on small PaaS instances.
-if os.getenv("NLTK_DOWNLOAD_ON_STARTUP", "0") == "1":
-    nltk.download("punkt_tab", quiet=True)
-    nltk.download("punkt", quiet=True)
+nltk.download("punkt_tab", quiet=True)
+nltk.download("punkt", quiet=True)
 
 import edge_tts
 from fastapi import FastAPI, HTTPException
@@ -90,7 +88,13 @@ def _get_nmt_model():
 
                 print("Loading EasyNMT translation model...")
                 nmt_model = EasyNMT("opus-mt")
-                print("EasyNMT model loaded.")
+                # Pre-download both language-pair models so the first
+                # real request doesn't trigger a ~300 MB HuggingFace download.
+                print("Pre-warming tl->en model...")
+                nmt_model.translate("Kamusta", target_lang="en", source_lang="tl")
+                print("Pre-warming en->tl model...")
+                nmt_model.translate("Hello", target_lang="tl", source_lang="en")
+                print("EasyNMT model loaded and warmed.")
     return nmt_model
 
 # ── Spell correction (symspellpy) ────────────────────────────────────────────
