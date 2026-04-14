@@ -267,8 +267,23 @@ async def translate_text(req: TranslateRequest):
     source_code = source
     target_code = target
 
+    # Split into sentence chunks to avoid overloading the model's memory.
+    # NLTK punkt tokeniser is already downloaded at startup.
     try:
-        translated = model.translate(req.text, target_lang=target_code, source_lang=source_code)
+        from nltk.tokenize import sent_tokenize
+        sentences = sent_tokenize(req.text)
+    except Exception:
+        # Fallback: split on newlines if NLTK fails
+        sentences = [s for s in req.text.splitlines() if s.strip()] or [req.text]
+
+    CHUNK_SIZE = 4  # sentences per batch
+    translated_parts: list[str] = []
+    try:
+        for i in range(0, len(sentences), CHUNK_SIZE):
+            chunk = " ".join(sentences[i : i + CHUNK_SIZE])
+            result = model.translate(chunk, target_lang=target_code, source_lang=source_code)
+            translated_parts.append(result)
+        translated = " ".join(translated_parts)
     except Exception as e:
         print(f"Translation error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
