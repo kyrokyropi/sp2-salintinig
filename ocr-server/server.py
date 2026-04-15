@@ -46,17 +46,10 @@ app.add_middleware(
 )
 
 
-@app.on_event("startup")
-async def _warmup():
-    """Load the OCR model in the background so the first real request isn't slow."""
-    import threading
-    threading.Thread(target=_get_ocr_model, daemon=True).start()
-
 # ── OCR model ────────────────────────────────────────────────────────────────
 # Lazy-load OCR so the web service can bind a port quickly on Render.
 _ocr_model = None
 _ocr_lock = Lock()
-_use_angle_cls = os.getenv("PADDLE_USE_ANGLE_CLS", "0") == "1"
 
 
 def _get_ocr_model():
@@ -68,17 +61,24 @@ def _get_ocr_model():
 
                 print("Loading PaddleOCR model...")
                 _ocr_model = PaddleOCR(
-                    use_angle_cls=_use_angle_cls,
+                    use_angle_cls=False,
                     lang="en",
                     show_log=False,
-                    # Limit the det model's internal resize to keep memory
-                    # under control on a 2 GB instance.  Default is 960 which
+                    # Use mobile/slim models — much smaller memory footprint.
+                    det_model_dir=None,
+                    # Limit the det model's internal resize.  Default 960
                     # causes huge feature-map allocations on text-dense images.
-                    det_limit_side_len=640,
+                    det_limit_side_len=480,
                     det_limit_type="max",
-                    # Limit recognition batch size — each crop goes through
-                    # the rec model; batching many at once spikes memory.
-                    rec_batch_num=4,
+                    # Small rec batch to avoid memory spikes when many text
+                    # regions are detected on a dense page.
+                    rec_batch_num=2,
+                    # Disable GPU to avoid VRAM issues; CPU is fine for OCR.
+                    use_gpu=False,
+                    # Enable mkldnn for faster CPU inference without extra RAM.
+                    enable_mkldnn=True,
+                    # Thread count — keep low to limit parallel memory use.
+                    cpu_threads=2,
                 )
                 print("PaddleOCR model loaded.")
     return _ocr_model
@@ -242,7 +242,7 @@ async def run_ocr(req: OCRRequest):
     for y in range(0, h, OCR_STRIP_HEIGHT):
         strip = img_np[y : y + OCR_STRIP_HEIGHT].copy()
         try:
-            results = ocr_model.ocr(strip, cls=_use_angle_cls)
+            results = ocr_model.ocr(strip, cls=False)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
         finally:
