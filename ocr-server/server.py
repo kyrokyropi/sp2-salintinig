@@ -24,12 +24,6 @@ from threading import Lock
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
-import nltk
-
-nltk.download("punkt_tab", quiet=True)
-nltk.download("punkt", quiet=True)
-
-import edge_tts
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import Response
@@ -50,6 +44,13 @@ app.add_middleware(
     allow_methods=["GET", "POST"],
     allow_headers=["Content-Type"],
 )
+
+
+@app.on_event("startup")
+async def _warmup():
+    """Load the OCR model in the background so the first real request isn't slow."""
+    import threading
+    threading.Thread(target=_get_ocr_model, daemon=True).start()
 
 # ── OCR model ────────────────────────────────────────────────────────────────
 # Lazy-load OCR so the web service can bind a port quickly on Render.
@@ -235,6 +236,7 @@ async def run_tts(req: TTSRequest):
     voice = _TTS_VOICES[lang]
 
     try:
+        import edge_tts
         with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
             tmp_path = tmp.name
         communicate = edge_tts.Communicate(text=req.text, voice=voice)
@@ -278,8 +280,10 @@ async def translate_text(req: TranslateRequest):
     target_code = target
 
     # Split into sentence chunks to avoid overloading the model's memory.
-    # NLTK punkt tokeniser is already downloaded at startup.
     try:
+        import nltk
+        nltk.download("punkt_tab", quiet=True)
+        nltk.download("punkt", quiet=True)
         from nltk.tokenize import sent_tokenize
         sentences = sent_tokenize(req.text)
     except Exception:
