@@ -193,13 +193,23 @@ async def run_ocr(req: OCRRequest):
         gc.collect()
 
     # ── Down-scale to cap PaddleOCR memory ───────────────────────────────
-    MAX_WIDTH = int(os.getenv("OCR_MAX_WIDTH", "1200"))
-    MAX_HEIGHT = int(os.getenv("OCR_MAX_HEIGHT", "4000"))
+    # PaddleOCR's det model internally pads to multiples of 32 and builds
+    # feature maps that are ~4× the pixel buffer.  On a 2 GB Render instance
+    # the model itself takes ~500 MB, leaving ~1.5 GB for request work.
+    # Keep the pixel budget under ~2 megapixels (e.g. 800×2500 = 2 MP).
+    MAX_WIDTH  = int(os.getenv("OCR_MAX_WIDTH",  "600"))
+    MAX_HEIGHT = int(os.getenv("OCR_MAX_HEIGHT", "1500"))
+    MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "800000"))  # 0.8 MP
     w_orig, h_orig = img.size
+
     scale = min(MAX_WIDTH / max(w_orig, 1), MAX_HEIGHT / max(h_orig, 1), 1.0)
+    # Also enforce total pixel budget
+    if w_orig * h_orig * scale * scale > MAX_PIXELS:
+        scale = (MAX_PIXELS / (w_orig * h_orig)) ** 0.5
+
     if scale < 1.0:
         img = img.resize(
-            (int(w_orig * scale), int(h_orig * scale)),
+            (max(1, int(w_orig * scale)), max(1, int(h_orig * scale))),
             Image.LANCZOS,
         )
 
@@ -210,7 +220,7 @@ async def run_ocr(req: OCRRequest):
     ocr_model = _get_ocr_model()
 
     # ── Process in horizontal strips ─────────────────────────────────────
-    OCR_STRIP_HEIGHT = int(os.getenv("OCR_STRIP_HEIGHT", "1000"))
+    OCR_STRIP_HEIGHT = int(os.getenv("OCR_STRIP_HEIGHT", "300"))
     h, w = img_np.shape[:2]
 
     lines: list[str] = []
