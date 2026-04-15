@@ -181,24 +181,34 @@ async def run_ocr(req: OCRRequest):
     img_np = np.array(img)
     ocr_model = _get_ocr_model()
 
-    try:
-        results = ocr_model.ocr(img_np, cls=_use_angle_cls)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+    # Chunk tall images into horizontal strips to avoid memory overload.
+    # Each strip is at most OCR_STRIP_HEIGHT pixels tall.
+    OCR_STRIP_HEIGHT = int(os.getenv("OCR_STRIP_HEIGHT", "1000"))
+    h, w = img_np.shape[:2]
+    strips = [
+        img_np[y : y + OCR_STRIP_HEIGHT]
+        for y in range(0, h, OCR_STRIP_HEIGHT)
+    ]
 
     lines: list[str] = []
     confidences: list[float] = []
 
-    if results:
-        for page in results:
-            if page is None:
-                continue
-            for item in page:
-                # item = (box, (text, confidence))
-                _, (text, conf) = item
-                if text and text.strip():
-                    lines.append(text.strip())
-                    confidences.append(float(conf))
+    for strip in strips:
+        try:
+            results = ocr_model.ocr(strip, cls=_use_angle_cls)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
+        if results:
+            for page in results:
+                if page is None:
+                    continue
+                for item in page:
+                    # item = (box, (text, confidence))
+                    _, (text, conf) = item
+                    if text and text.strip():
+                        lines.append(text.strip())
+                        confidences.append(float(conf))
 
     avg_conf = (sum(confidences) / len(confidences) * 100) if confidences else 0.0
 
