@@ -167,51 +167,82 @@ class OCRResponse(BaseModel):
 
 @app.post("/ocr", response_model=OCRResponse)
 async def run_ocr(req: OCRRequest):
-    # Decode image
+    import numpy as np
+    import gc
+
+    # ── Decode image & free the base64 payload ASAP ──────────────────────
     try:
         b64 = req.image
         if "," in b64:
             b64 = b64.split(",", 1)[1]
         img_bytes = base64.b64decode(b64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+    finally:
+        # The request body holds the full base64 string (~4 MB for a 3 MB
+        # photo).  Overwrite it so the GC can reclaim that memory while we
+        # work on the pixels.
+        req.image = ""
+
+    try:
         img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
     except Exception as e:
         raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+    finally:
+        del img_bytes
+        gc.collect()
 
-    # PaddleOCR 2.x works with numpy arrays directly
-    import numpy as np
+    # ── Down-scale to cap PaddleOCR memory ───────────────────────────────
+    MAX_WIDTH = int(os.getenv("OCR_MAX_WIDTH", "1200"))
+    MAX_HEIGHT = int(os.getenv("OCR_MAX_HEIGHT", "4000"))
+    w_orig, h_orig = img.size
+    scale = min(MAX_WIDTH / max(w_orig, 1), MAX_HEIGHT / max(h_orig, 1), 1.0)
+    if scale < 1.0:
+        img = img.resize(
+            (int(w_orig * scale), int(h_orig * scale)),
+            Image.LANCZOS,
+        )
+
     img_np = np.array(img)
+    del img
+    gc.collect()
+
     ocr_model = _get_ocr_model()
 
-    # Chunk tall images into horizontal strips to avoid memory overload.
-    # Each strip is at most OCR_STRIP_HEIGHT pixels tall.
+    # ── Process in horizontal strips ─────────────────────────────────────
     OCR_STRIP_HEIGHT = int(os.getenv("OCR_STRIP_HEIGHT", "1000"))
     h, w = img_np.shape[:2]
-    strips = [
-        img_np[y : y + OCR_STRIP_HEIGHT]
-        for y in range(0, h, OCR_STRIP_HEIGHT)
-    ]
 
     lines: list[str] = []
-    confidences: list[float] = []
+    conf_sum = 0.0
+    conf_count = 0
 
-    for strip in strips:
+    for y in range(0, h, OCR_STRIP_HEIGHT):
+        strip = img_np[y : y + OCR_STRIP_HEIGHT].copy()
         try:
             results = ocr_model.ocr(strip, cls=_use_angle_cls)
         except Exception as e:
             raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+        finally:
+            del strip
 
         if results:
             for page in results:
                 if page is None:
                     continue
                 for item in page:
-                    # item = (box, (text, confidence))
                     _, (text, conf) = item
                     if text and text.strip():
                         lines.append(text.strip())
-                        confidences.append(float(conf))
+                        conf_sum += float(conf)
+                        conf_count += 1
+        del results
+        gc.collect()
 
-    avg_conf = (sum(confidences) / len(confidences) * 100) if confidences else 0.0
+    del img_np
+    gc.collect()
+
+    avg_conf = (conf_sum / conf_count * 100) if conf_count else 0.0
 
     raw_text = "\n".join(lines) if lines else ""
     corrected_text = _correct_text(raw_text) if raw_text else ""
@@ -264,6 +295,8 @@ class TranslateResponse(BaseModel):
 
 @app.post("/translate", response_model=TranslateResponse)
 async def translate_text(req: TranslateRequest):
+    import gc
+
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text is empty")
     try:
@@ -271,32 +304,32 @@ async def translate_text(req: TranslateRequest):
     except Exception as e:
         raise HTTPException(status_code=503, detail=str(e))
 
-    source = req.source_lang.strip() or _detect_lang(req.text)
-    # Normalise: only 'en' and 'tl' supported (display names)
+    text = req.text
+    source = req.source_lang.strip() or _detect_lang(text)
     source = "tl" if source in ("tl", "fil") else "en"
     target = "en" if source == "tl" else "tl"
 
-    source_code = source
-    target_code = target
-
-    # Split into sentence chunks to avoid overloading the model's memory.
+    # Split into sentence chunks to keep opus-mt's internal buffers small.
     try:
         import nltk
         nltk.download("punkt_tab", quiet=True)
         nltk.download("punkt", quiet=True)
         from nltk.tokenize import sent_tokenize
-        sentences = sent_tokenize(req.text)
+        sentences = sent_tokenize(text)
     except Exception:
-        # Fallback: split on newlines if NLTK fails
-        sentences = [s for s in req.text.splitlines() if s.strip()] or [req.text]
+        sentences = [s for s in text.splitlines() if s.strip()] or [text]
 
-    CHUNK_SIZE = 4  # sentences per batch
+    # Translate 2 sentences at a time — opus-mt allocates memory proportional
+    # to input token count; smaller chunks keep peak RSS low.
+    CHUNK_SIZE = 2
     translated_parts: list[str] = []
     try:
         for i in range(0, len(sentences), CHUNK_SIZE):
             chunk = " ".join(sentences[i : i + CHUNK_SIZE])
-            result = model.translate(chunk, target_lang=target_code, source_lang=source_code)
+            result = model.translate(chunk, target_lang=target, source_lang=source)
             translated_parts.append(result)
+            del chunk, result
+            gc.collect()
         translated = " ".join(translated_parts)
     except Exception as e:
         print(f"Translation error: {e}\n{traceback.format_exc()}")
