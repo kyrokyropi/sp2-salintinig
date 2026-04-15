@@ -67,7 +67,19 @@ def _get_ocr_model():
                 from paddleocr import PaddleOCR
 
                 print("Loading PaddleOCR model...")
-                _ocr_model = PaddleOCR(use_angle_cls=_use_angle_cls, lang="en", show_log=False)
+                _ocr_model = PaddleOCR(
+                    use_angle_cls=_use_angle_cls,
+                    lang="en",
+                    show_log=False,
+                    # Limit the det model's internal resize to keep memory
+                    # under control on a 2 GB instance.  Default is 960 which
+                    # causes huge feature-map allocations on text-dense images.
+                    det_limit_side_len=640,
+                    det_limit_type="max",
+                    # Limit recognition batch size — each crop goes through
+                    # the rec model; batching many at once spikes memory.
+                    rec_batch_num=4,
+                )
                 print("PaddleOCR model loaded.")
     return _ocr_model
 
