@@ -1,4 +1,4 @@
-export const PADDLEOCR_URL = "http://192.168.1.232:8000";
+export const PADDLEOCR_URL = "https://sp2-salintinig.onrender.com";
 
 
 export type OCRResult = {
