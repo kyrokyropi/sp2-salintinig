@@ -23,7 +23,7 @@ import { Image } from 'expo-image';
 import { ImageManipulator, SaveFormat } from 'expo-image-manipulator';
 import * as Print from 'expo-print';
 import * as Sharing from 'expo-sharing';
-import { recognizeImage } from '@/components/ocr-service';
+import { recognizeImage, correctText } from '@/components/ocr-service';
 import { translateTo, type TTSLanguage } from '@/components/tts-service';
 import { CropView, type PixelCropRegion } from '@/components/crop-view';
 import {
@@ -126,18 +126,44 @@ export default function ScannerScreen() {
       setScreen('processing');
 
       try {
-        const ctx = ImageManipulator.manipulate(capturedUri);
-        ctx.crop({ originX: region.originX, originY: region.originY, width: region.width, height: region.height });
-        const imageRef = await ctx.renderAsync();
-        const cropped = await imageRef.saveAsync({ format: SaveFormat.JPEG, compress: 0.92, base64: true });
+        // 1. Crop the image
+        const cropCtx = ImageManipulator.manipulate(capturedUri);
+        cropCtx.crop({ originX: region.originX, originY: region.originY, width: region.width, height: region.height });
+        const cropRef = await cropCtx.renderAsync();
 
-        setCroppedUri(cropped.uri);
+        // 2. Resize if too large — cap longest side at 1500px to save memory
+        const MAX_SIDE = 1500;
+        const needsResize = region.width > MAX_SIDE || region.height > MAX_SIDE;
+        let finalRef = cropRef;
+        if (needsResize) {
+          const scale = MAX_SIDE / Math.max(region.width, region.height);
+          const resizeCtx = ImageManipulator.manipulate(cropRef.uri);
+          resizeCtx.resize({
+            width: Math.round(region.width * scale),
+            height: Math.round(region.height * scale),
+          });
+          finalRef = await resizeCtx.renderAsync();
+        }
 
-        if (!cropped.base64) throw new Error('No base64 from crop');
+        // 3. Save as JPEG with moderate compression (0.7 is plenty for text)
+        const saved = await finalRef.saveAsync({ format: SaveFormat.JPEG, compress: 0.7, base64: true });
+        setCroppedUri(saved.uri);
 
-        const result = await recognizeImage(cropped.base64);
-        setScannedText(result.text);
+        if (!saved.base64) throw new Error('No base64 from crop');
+
+        // 4. Extract base64, send to OCR, then let the string get GC'd
+        const base64 = saved.base64;
+        const result = await recognizeImage(base64);
         setConfidence(result.confidence);
+        let finalText = result.text;
+        if (result.text.trim()) {
+          try {
+            finalText = await correctText(result.text);
+          } catch {
+            // correction failed — fall back to raw OCR text
+          }
+        }
+        setScannedText(finalText);
         setScreen('result');
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
