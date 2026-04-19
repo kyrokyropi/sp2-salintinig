@@ -272,45 +272,22 @@ class OCRResponse(BaseModel):
     confidence: float
 
 
-@app.post("/ocr", response_model=OCRResponse)
-async def run_ocr(req: OCRRequest):
+def _run_ocr_blocking(img_bytes: bytes) -> tuple[str, float]:
+    """Heavy OCR work — PIL decode, resize, PaddleOCR inference. Must run in a
+    thread so the asyncio event loop stays free to answer health checks."""
     import numpy as np
     import gc
 
-    # ── Decode image & free the base64 payload ASAP ──────────────────────
-    try:
-        b64 = req.image
-        if "," in b64:
-            b64 = b64.split(",", 1)[1]
-        img_bytes = base64.b64decode(b64)
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-    finally:
-        # The request body holds the full base64 string (~4 MB for a 3 MB
-        # photo).  Overwrite it so the GC can reclaim that memory while we
-        # work on the pixels.
-        req.image = ""
+    img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+    del img_bytes
+    gc.collect()
 
-    try:
-        img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
-    except Exception as e:
-        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
-    finally:
-        del img_bytes
-        gc.collect()
-
-    # ── Down-scale to cap PaddleOCR memory ───────────────────────────────
-    # PaddleOCR's det model internally pads to multiples of 32 and builds
-    # feature maps that are ~4× the pixel buffer.  On a 2 GB Render instance
-    # the model itself takes ~500 MB, leaving ~1.5 GB for request work.
-    # Keep the pixel budget under ~2 megapixels (e.g. 800×2500 = 2 MP).
     MAX_WIDTH  = int(os.getenv("OCR_MAX_WIDTH",  "600"))
     MAX_HEIGHT = int(os.getenv("OCR_MAX_HEIGHT", "1500"))
-    MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "800000"))  # 0.8 MP
+    MAX_PIXELS = int(os.getenv("OCR_MAX_PIXELS", "800000"))
     w_orig, h_orig = img.size
 
     scale = min(MAX_WIDTH / max(w_orig, 1), MAX_HEIGHT / max(h_orig, 1), 1.0)
-    # Also enforce total pixel budget
     if w_orig * h_orig * scale * scale > MAX_PIXELS:
         scale = (MAX_PIXELS / (w_orig * h_orig)) ** 0.5
 
@@ -326,9 +303,8 @@ async def run_ocr(req: OCRRequest):
 
     ocr_model = _get_ocr_model()
 
-    # ── Process in horizontal strips ─────────────────────────────────────
     OCR_STRIP_HEIGHT = int(os.getenv("OCR_STRIP_HEIGHT", "300"))
-    h, w = img_np.shape[:2]
+    h, _w = img_np.shape[:2]
 
     lines: list[str] = []
     conf_sum = 0.0
@@ -338,8 +314,6 @@ async def run_ocr(req: OCRRequest):
         strip = img_np[y : y + OCR_STRIP_HEIGHT].copy()
         try:
             results = ocr_model.ocr(strip, cls=False)
-        except Exception as e:
-            raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
         finally:
             del strip
 
@@ -360,14 +334,33 @@ async def run_ocr(req: OCRRequest):
     gc.collect()
 
     avg_conf = (conf_sum / conf_count * 100) if conf_count else 0.0
-
     raw_text = "\n".join(lines) if lines else ""
     corrected_text = _correct_text(raw_text) if raw_text else ""
+    return corrected_text, round(avg_conf, 1)
 
-    return OCRResponse(
-        text=corrected_text,
-        confidence=round(avg_conf, 1),
-    )
+
+@app.post("/ocr", response_model=OCRResponse)
+async def run_ocr(req: OCRRequest):
+    # ── Decode image & free the base64 payload ASAP ──────────────────────
+    try:
+        b64 = req.image
+        if "," in b64:
+            b64 = b64.split(",", 1)[1]
+        img_bytes = base64.b64decode(b64)
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Invalid image: {e}")
+    finally:
+        req.image = ""
+
+    try:
+        text, conf = await asyncio.to_thread(_run_ocr_blocking, img_bytes)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"[ocr] failed: {e!r}")
+        raise HTTPException(status_code=500, detail=f"OCR failed: {e}")
+
+    return OCRResponse(text=text, confidence=conf)
 
 
 class TTSRequest(BaseModel):
@@ -504,6 +497,16 @@ async def health():
 
 @app.on_event("startup")
 async def _start_idle_sweeper():
+    # Warm up the PaddleOCR model on boot so the first real /ocr request doesn't
+    # spend ~30s loading weights (which can cause APK clients to time out).
+    async def warm_ocr():
+        try:
+            await asyncio.to_thread(_get_ocr_model)
+            print("[ocr] warm-up complete")
+        except Exception as e:
+            print(f"[ocr] warm-up failed: {e}")
+    asyncio.create_task(warm_ocr())
+
     async def sweep():
         while True:
             await asyncio.sleep(30)
