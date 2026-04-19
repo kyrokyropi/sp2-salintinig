@@ -165,10 +165,29 @@ def _translate_ct2(text: str, direction: str) -> str:
     entry = _get_ct2(direction)
     tokenizer = entry["tokenizer"]
     translator = entry["translator"]
-    tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
-    results = translator.translate_batch([tokens], beam_size=2, max_batch_size=1)
-    out_tokens = results[0].hypotheses[0]
-    return tokenizer.decode(tokenizer.convert_tokens_to_ids(out_tokens), skip_special_tokens=True)
+
+    # opus-mt hard caps input at 512 tokens; stay well under to leave room for EOS/specials.
+    MAX_INPUT_TOKENS = 400
+    ids = tokenizer.encode(text, add_special_tokens=True)
+    if len(ids) <= MAX_INPUT_TOKENS:
+        id_batches = [ids]
+    else:
+        id_batches = [ids[i : i + MAX_INPUT_TOKENS] for i in range(0, len(ids), MAX_INPUT_TOKENS)]
+
+    token_batches = [tokenizer.convert_ids_to_tokens(b) for b in id_batches]
+    results = translator.translate_batch(
+        token_batches,
+        beam_size=2,
+        max_batch_size=1,
+        max_decoding_length=512,
+    )
+    out_parts = []
+    for r in results:
+        out_tokens = r.hypotheses[0]
+        out_parts.append(
+            tokenizer.decode(tokenizer.convert_tokens_to_ids(out_tokens), skip_special_tokens=True)
+        )
+    return " ".join(p for p in out_parts if p)
 
 # ── Spell correction (symspellpy) ────────────────────────────────────────────
 try:
@@ -384,22 +403,45 @@ async def translate_text(req: TranslateRequest):
         raise HTTPException(status_code=400, detail="text is empty")
 
     text = req.text
-    source = req.source_lang.strip() or _detect_lang(text)
-    source = "tl" if source in ("tl", "fil") else "en"
-    target = "en" if source == "tl" else "tl"
-    direction = f"{source}->{target}"
+    forced_source = req.source_lang.strip()
+    doc_source = forced_source or _detect_lang(text)
+    doc_source = "tl" if doc_source in ("tl", "fil") else "en"
+    doc_target = "en" if doc_source == "tl" else "tl"
 
     # Lightweight sentence split — keeps tokenizer buffers small.
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     if not sentences:
         sentences = [text]
 
-    CHUNK_SIZE = 2
     translated_parts: list[str] = []
     try:
-        for i in range(0, len(sentences), CHUNK_SIZE):
-            chunk = " ".join(sentences[i : i + CHUNK_SIZE])
-            translated_parts.append(_translate_ct2(chunk, direction))
+        for sent in sentences:
+            if not sent.strip():
+                continue
+            # Per-sentence language detection so mixed-language docs work.
+            # If user forced a source lang, honor it for every sentence.
+            if forced_source:
+                sent_source = doc_source
+            else:
+                sent_source = _detect_lang(sent)
+                sent_source = "tl" if sent_source in ("tl", "fil") else "en"
+            sent_target = "en" if sent_source == "tl" else "tl"
+            if sent_source == doc_target:
+                # Sentence is already in the target language — pass through.
+                translated_parts.append(sent)
+                continue
+            sent_direction = f"{sent_source}->{sent_target}"
+            try:
+                out = _translate_ct2(sent, sent_direction)
+            except Exception as e:
+                print(f"[translate] sentence failed ({sent_direction}): {e!r} | {sent[:80]!r}")
+                out = ""
+            if out.strip():
+                translated_parts.append(out)
+            else:
+                # Fall back to original so the sentence isn't silently dropped.
+                print(f"[translate] empty output, keeping original: {sent[:80]!r}")
+                translated_parts.append(sent)
             gc.collect()
         translated = " ".join(translated_parts)
     except RuntimeError as e:
@@ -407,6 +449,9 @@ async def translate_text(req: TranslateRequest):
     except Exception as e:
         print(f"Translation error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
+
+    source = doc_source
+    target = doc_target
 
     return TranslateResponse(translated=translated, from_lang=source, to_lang=target)
 
