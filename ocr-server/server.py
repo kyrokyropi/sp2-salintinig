@@ -403,64 +403,62 @@ class TranslateResponse(BaseModel):
     to_lang: str
 
 
-@app.post("/translate", response_model=TranslateResponse)
-async def translate_text(req: TranslateRequest):
+def _run_translate_blocking(text: str, forced_source: str) -> tuple[str, str, str]:
     import gc
     import re
 
-    if not req.text.strip():
-        raise HTTPException(status_code=400, detail="text is empty")
-
-    text = req.text
-    forced_source = req.source_lang.strip()
     doc_source = forced_source or _detect_lang(text)
     doc_source = "tl" if doc_source in ("tl", "fil") else "en"
     doc_target = "en" if doc_source == "tl" else "tl"
 
-    # Lightweight sentence split — keeps tokenizer buffers small.
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     if not sentences:
         sentences = [text]
 
     translated_parts: list[str] = []
+    for sent in sentences:
+        if not sent.strip():
+            continue
+        if forced_source:
+            sent_source = doc_source
+        else:
+            sent_source = _detect_lang(sent)
+            sent_source = "tl" if sent_source in ("tl", "fil") else "en"
+        sent_target = "en" if sent_source == "tl" else "tl"
+        if sent_source == doc_target:
+            translated_parts.append(sent)
+            continue
+        sent_direction = f"{sent_source}->{sent_target}"
+        try:
+            out = _translate_ct2(sent, sent_direction)
+        except Exception as e:
+            print(f"[translate] sentence failed ({sent_direction}): {e!r} | {sent[:80]!r}")
+            out = ""
+        if out.strip():
+            translated_parts.append(out)
+        else:
+            print(f"[translate] empty output, keeping original: {sent[:80]!r}")
+            translated_parts.append(sent)
+        gc.collect()
+
+    return " ".join(translated_parts), doc_source, doc_target
+
+
+@app.post("/translate", response_model=TranslateResponse)
+async def translate_text(req: TranslateRequest):
+    if not req.text.strip():
+        raise HTTPException(status_code=400, detail="text is empty")
+
+    forced = req.source_lang.strip()
     try:
-        for sent in sentences:
-            if not sent.strip():
-                continue
-            # Per-sentence language detection so mixed-language docs work.
-            # If user forced a source lang, honor it for every sentence.
-            if forced_source:
-                sent_source = doc_source
-            else:
-                sent_source = _detect_lang(sent)
-                sent_source = "tl" if sent_source in ("tl", "fil") else "en"
-            sent_target = "en" if sent_source == "tl" else "tl"
-            if sent_source == doc_target:
-                # Sentence is already in the target language — pass through.
-                translated_parts.append(sent)
-                continue
-            sent_direction = f"{sent_source}->{sent_target}"
-            try:
-                out = _translate_ct2(sent, sent_direction)
-            except Exception as e:
-                print(f"[translate] sentence failed ({sent_direction}): {e!r} | {sent[:80]!r}")
-                out = ""
-            if out.strip():
-                translated_parts.append(out)
-            else:
-                # Fall back to original so the sentence isn't silently dropped.
-                print(f"[translate] empty output, keeping original: {sent[:80]!r}")
-                translated_parts.append(sent)
-            gc.collect()
-        translated = " ".join(translated_parts)
+        translated, source, target = await asyncio.to_thread(
+            _run_translate_blocking, req.text, forced
+        )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         print(f"Translation error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
-
-    source = doc_source
-    target = doc_target
 
     return TranslateResponse(translated=translated, from_lang=source, to_lang=target)
 
