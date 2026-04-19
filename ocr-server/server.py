@@ -146,6 +146,10 @@ def _unload_idle_nmt():
         gc.collect()
 
 
+_nmt_failures: dict[str, tuple[float, str]] = {}  # direction -> (timestamp, error msg)
+_NMT_FAIL_COOLDOWN = 60  # retry load this often after a failure
+
+
 def _get_ct2(direction: str):
     import time
     if not _enable_nmt:
@@ -153,10 +157,20 @@ def _get_ct2(direction: str):
     if direction not in _CT2_REPOS:
         raise ValueError(f"Unsupported direction: {direction}")
     _unload_idle_nmt()
+    # Fast-fail if a recent load attempt failed, to avoid a retry storm.
+    if direction in _nmt_failures:
+        ts, err = _nmt_failures[direction]
+        if time.time() - ts < _NMT_FAIL_COOLDOWN:
+            raise RuntimeError(f"Translator load failed recently: {err}")
+        del _nmt_failures[direction]
     if direction not in _nmt_cache:
         with _nmt_lock:
             if direction not in _nmt_cache:
-                _nmt_cache[direction] = _convert_and_load_ct2(direction)
+                try:
+                    _nmt_cache[direction] = _convert_and_load_ct2(direction)
+                except Exception as e:
+                    _nmt_failures[direction] = (time.time(), str(e))
+                    raise
     _nmt_cache[direction]["last_used"] = time.time()
     return _nmt_cache[direction]
 
