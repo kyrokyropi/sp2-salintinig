@@ -89,8 +89,15 @@ def _get_ocr_model():
 _enable_nmt = os.getenv("ENABLE_NMT", "1") == "1"
 _NMT_IDLE_SECONDS = int(os.getenv("NMT_IDLE_SECONDS", "120"))
 
-# Pre-converted int8 CT2 checkpoints on the HF Hub.
+# Pre-converted CTranslate2 checkpoints (no conversion step, no torch dependency).
+# These are full precision (~300 MB each); we load them with compute_type="int8"
+# so CTranslate2 quantizes the weights in-memory on load. Smaller RAM than fp32.
 _CT2_REPOS: dict[str, str] = {
+    "tl->en": "gaudi/opus-mt-tl-en-ctranslate2",
+    "en->tl": "gaudi/opus-mt-en-tl-ctranslate2",
+}
+# Helsinki-NLP originals — used only for loading the tokenizer (small files).
+_HF_TOKENIZER_REPOS: dict[str, str] = {
     "tl->en": "Helsinki-NLP/opus-mt-tl-en",
     "en->tl": "Helsinki-NLP/opus-mt-en-tl",
 }
@@ -102,28 +109,23 @@ _nmt_last_gc = 0.0
 
 
 def _convert_and_load_ct2(direction: str):
-    """Download opus-mt, convert to CT2 int8, and load. Cached on disk."""
+    """Download pre-converted CTranslate2 opus-mt and load at int8 compute."""
     import time
     import ctranslate2
     from transformers import AutoTokenizer
     from huggingface_hub import snapshot_download
 
-    repo = _CT2_REPOS[direction]
-    cache_root = os.getenv("CT2_CACHE_DIR", os.path.expanduser("~/.cache/ct2-opus-mt"))
-    ct2_dir = os.path.join(cache_root, direction.replace("->", "_") + "_int8")
+    ct2_repo = _CT2_REPOS[direction]
+    tok_repo = _HF_TOKENIZER_REPOS[direction]
 
-    if not os.path.exists(os.path.join(ct2_dir, "model.bin")):
-        print(f"[nmt] Downloading {repo}...")
-        hf_dir = snapshot_download(repo_id=repo)
-        print(f"[nmt] Converting {repo} to CTranslate2 int8...")
-        from ctranslate2.converters import TransformersConverter
-        os.makedirs(cache_root, exist_ok=True)
-        TransformersConverter(hf_dir).convert(ct2_dir, quantization="int8", force=True)
-        print(f"[nmt] Converted → {ct2_dir}")
+    print(f"[nmt] Downloading pre-converted CT2 model: {ct2_repo}...")
+    ct2_dir = snapshot_download(repo_id=ct2_repo)
 
-    print(f"[nmt] Loading {direction} translator (int8)...")
-    translator = ctranslate2.Translator(ct2_dir, device="cpu", compute_type="int8", inter_threads=1, intra_threads=2)
-    tokenizer = AutoTokenizer.from_pretrained(_CT2_REPOS[direction])
+    print(f"[nmt] Loading {direction} translator (int8 compute)...")
+    translator = ctranslate2.Translator(
+        ct2_dir, device="cpu", compute_type="int8", inter_threads=1, intra_threads=2
+    )
+    tokenizer = AutoTokenizer.from_pretrained(tok_repo)
     return {"translator": translator, "tokenizer": tokenizer, "last_used": time.time()}
 
 
