@@ -83,32 +83,92 @@ def _get_ocr_model():
                 print("PaddleOCR model loaded.")
     return _ocr_model
 
-# ── EasyNMT translation model ─────────────────────────────────────────────────
-# EasyNMT is memory-heavy; keep it optional and lazy-loaded.
-_enable_easynmt = os.getenv("ENABLE_EASYNMT", "0") == "1"
-nmt_model = None
+# ── CTranslate2 + int8-quantized opus-mt ─────────────────────────────────────
+# Lazy-loaded per direction. Each int8 model is ~75 MB on disk / ~150 MB RAM.
+# Models auto-unload after NMT_IDLE_SECONDS of inactivity to free RAM.
+_enable_nmt = os.getenv("ENABLE_NMT", "1") == "1"
+_NMT_IDLE_SECONDS = int(os.getenv("NMT_IDLE_SECONDS", "120"))
+
+# Pre-converted int8 CT2 checkpoints on the HF Hub.
+_CT2_REPOS: dict[str, str] = {
+    "tl->en": "Helsinki-NLP/opus-mt-tl-en",
+    "en->tl": "Helsinki-NLP/opus-mt-en-tl",
+}
+
+# Each entry: {"translator": ctranslate2.Translator, "tokenizer": AutoTokenizer, "last_used": float}
+_nmt_cache: dict[str, dict] = {}
 _nmt_lock = Lock()
+_nmt_last_gc = 0.0
 
 
-def _get_nmt_model():
-    global nmt_model
-    if not _enable_easynmt:
+def _convert_and_load_ct2(direction: str):
+    """Download opus-mt, convert to CT2 int8, and load. Cached on disk."""
+    import time
+    import ctranslate2
+    from transformers import AutoTokenizer
+    from huggingface_hub import snapshot_download
+
+    repo = _CT2_REPOS[direction]
+    cache_root = os.getenv("CT2_CACHE_DIR", os.path.expanduser("~/.cache/ct2-opus-mt"))
+    ct2_dir = os.path.join(cache_root, direction.replace("->", "_") + "_int8")
+
+    if not os.path.exists(os.path.join(ct2_dir, "model.bin")):
+        print(f"[nmt] Downloading {repo}...")
+        hf_dir = snapshot_download(repo_id=repo)
+        print(f"[nmt] Converting {repo} to CTranslate2 int8...")
+        from ctranslate2.converters import TransformersConverter
+        os.makedirs(cache_root, exist_ok=True)
+        TransformersConverter(hf_dir).convert(ct2_dir, quantization="int8", force=True)
+        print(f"[nmt] Converted → {ct2_dir}")
+
+    print(f"[nmt] Loading {direction} translator (int8)...")
+    translator = ctranslate2.Translator(ct2_dir, device="cpu", compute_type="int8", inter_threads=1, intra_threads=2)
+    tokenizer = AutoTokenizer.from_pretrained(_CT2_REPOS[direction])
+    return {"translator": translator, "tokenizer": tokenizer, "last_used": time.time()}
+
+
+def _unload_idle_nmt():
+    """Drop translators that haven't been used in NMT_IDLE_SECONDS."""
+    import time
+    import gc
+    global _nmt_last_gc
+    now = time.time()
+    if now - _nmt_last_gc < 10:
+        return
+    _nmt_last_gc = now
+    stale = [k for k, v in _nmt_cache.items() if now - v["last_used"] > _NMT_IDLE_SECONDS]
+    for k in stale:
+        print(f"[nmt] Unloading idle translator: {k}")
+        entry = _nmt_cache.pop(k)
+        # CT2 translator releases memory when the Python object is collected.
+        del entry
+    if stale:
+        gc.collect()
+
+
+def _get_ct2(direction: str):
+    import time
+    if not _enable_nmt:
         raise RuntimeError("Translation disabled on this deployment")
-    if nmt_model is None:
+    if direction not in _CT2_REPOS:
+        raise ValueError(f"Unsupported direction: {direction}")
+    _unload_idle_nmt()
+    if direction not in _nmt_cache:
         with _nmt_lock:
-            if nmt_model is None:
-                from easynmt import EasyNMT
+            if direction not in _nmt_cache:
+                _nmt_cache[direction] = _convert_and_load_ct2(direction)
+    _nmt_cache[direction]["last_used"] = time.time()
+    return _nmt_cache[direction]
 
-                print("Loading EasyNMT translation model...")
-                nmt_model = EasyNMT("opus-mt")
-                # Pre-download both language-pair models so the first
-                # real request doesn't trigger a ~300 MB HuggingFace download.
-                print("Pre-warming tl->en model...")
-                nmt_model.translate("Kamusta", target_lang="en", source_lang="tl")
-                print("Pre-warming en->tl model...")
-                nmt_model.translate("Hello", target_lang="tl", source_lang="en")
-                print("EasyNMT model loaded and warmed.")
-    return nmt_model
+
+def _translate_ct2(text: str, direction: str) -> str:
+    entry = _get_ct2(direction)
+    tokenizer = entry["tokenizer"]
+    translator = entry["translator"]
+    tokens = tokenizer.convert_ids_to_tokens(tokenizer.encode(text))
+    results = translator.translate_batch([tokens], beam_size=2, max_batch_size=1)
+    out_tokens = results[0].hypotheses[0]
+    return tokenizer.decode(tokenizer.convert_tokens_to_ids(out_tokens), skip_special_tokens=True)
 
 # ── Spell correction (symspellpy) ────────────────────────────────────────────
 try:
@@ -318,41 +378,32 @@ class TranslateResponse(BaseModel):
 @app.post("/translate", response_model=TranslateResponse)
 async def translate_text(req: TranslateRequest):
     import gc
+    import re
 
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text is empty")
-    try:
-        model = _get_nmt_model()
-    except Exception as e:
-        raise HTTPException(status_code=503, detail=str(e))
 
     text = req.text
     source = req.source_lang.strip() or _detect_lang(text)
     source = "tl" if source in ("tl", "fil") else "en"
     target = "en" if source == "tl" else "tl"
+    direction = f"{source}->{target}"
 
-    # Split into sentence chunks to keep opus-mt's internal buffers small.
-    try:
-        import nltk
-        nltk.download("punkt_tab", quiet=True)
-        nltk.download("punkt", quiet=True)
-        from nltk.tokenize import sent_tokenize
-        sentences = sent_tokenize(text)
-    except Exception:
-        sentences = [s for s in text.splitlines() if s.strip()] or [text]
+    # Lightweight sentence split — keeps tokenizer buffers small.
+    sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
+    if not sentences:
+        sentences = [text]
 
-    # Translate 2 sentences at a time — opus-mt allocates memory proportional
-    # to input token count; smaller chunks keep peak RSS low.
     CHUNK_SIZE = 2
     translated_parts: list[str] = []
     try:
         for i in range(0, len(sentences), CHUNK_SIZE):
             chunk = " ".join(sentences[i : i + CHUNK_SIZE])
-            result = model.translate(chunk, target_lang=target, source_lang=source)
-            translated_parts.append(result)
-            del chunk, result
+            translated_parts.append(_translate_ct2(chunk, direction))
             gc.collect()
         translated = " ".join(translated_parts)
+    except RuntimeError as e:
+        raise HTTPException(status_code=503, detail=str(e))
     except Exception as e:
         print(f"Translation error: {e}\n{traceback.format_exc()}")
         raise HTTPException(status_code=500, detail=f"Translation failed: {e}")
@@ -387,4 +438,16 @@ async def correct_text(req: CorrectRequest):
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    return {"status": "ok", "nmt_loaded": list(_nmt_cache.keys())}
+
+
+@app.on_event("startup")
+async def _start_idle_sweeper():
+    async def sweep():
+        while True:
+            await asyncio.sleep(30)
+            try:
+                _unload_idle_nmt()
+            except Exception as e:
+                print(f"[nmt] sweep error: {e}")
+    asyncio.create_task(sweep())

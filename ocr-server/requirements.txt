@@ -7,8 +7,10 @@ numpy
 setuptools
 # edge-tts – Microsoft neural voices, Python 3.12 compatible, no API key needed
 edge-tts
-# Translation
-easynmt
+# Translation — CTranslate2 with int8-quantized opus-mt (~75MB/direction)
+ctranslate2
+transformers
+sentencepiece
+huggingface_hub
 langdetect
-nltk
 symspellpy
