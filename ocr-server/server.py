@@ -89,12 +89,12 @@ def _get_ocr_model():
 _enable_nmt = os.getenv("ENABLE_NMT", "1") == "1"
 _NMT_IDLE_SECONDS = int(os.getenv("NMT_IDLE_SECONDS", "120"))
 
-# Pre-converted CTranslate2 checkpoints (no conversion step, no torch dependency).
-# These are full precision (~300 MB each); we load them with compute_type="int8"
-# so CTranslate2 quantizes the weights in-memory on load. Smaller RAM than fp32.
+# Pre-converted, pre-quantized CTranslate2 checkpoints (Android-targeted int8).
+# Each repo is ~75 MB on disk and loads with compute_type="int8" — smallest option
+# on the Hub that actually ships a valid model.bin.
 _CT2_REPOS: dict[str, str] = {
-    "tl->en": "gaudi/opus-mt-tl-en-ctranslate2",
-    "en->tl": "gaudi/opus-mt-en-tl-ctranslate2",
+    "tl->en": "manancode/opus-mt-tl-en-ctranslate2-android",
+    "en->tl": "manancode/opus-mt-en-tl-ctranslate2-android",
 }
 # Helsinki-NLP originals — used only for loading the tokenizer (small files).
 _HF_TOKENIZER_REPOS: dict[str, str] = {
