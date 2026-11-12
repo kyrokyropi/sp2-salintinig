@@ -1,7 +1,9 @@
 fastapi
 uvicorn[standard]
 paddleocr==2.10.0
-paddlepaddle==2.6.2
+# 2.6.2 crashes during native inference on Apple Silicon.
+paddlepaddle==3.0.0; sys_platform == "darwin"
+paddlepaddle==2.6.2; sys_platform != "darwin"
 Pillow
 numpy
 setuptools

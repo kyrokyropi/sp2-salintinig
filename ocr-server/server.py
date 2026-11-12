@@ -18,9 +18,11 @@ import asyncio
 import base64
 import io
 import os
+import sys
 import tempfile
 import traceback
 from threading import Lock
+from typing import Literal
 
 os.environ.setdefault("PADDLE_PDX_DISABLE_MODEL_SOURCE_CHECK", "True")
 
@@ -42,7 +44,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
     allow_methods=["GET", "POST"],
-    allow_headers=["Content-Type"],
+    allow_headers=["Content-Type", "ngrok-skip-browser-warning"],
 )
 
 
@@ -75,8 +77,8 @@ def _get_ocr_model():
                     rec_batch_num=2,
                     # Disable GPU to avoid VRAM issues; CPU is fine for OCR.
                     use_gpu=False,
-                    # Enable mkldnn for faster CPU inference without extra RAM.
-                    enable_mkldnn=True,
+                    # macOS Paddle builds lack the MKL-DNN configuration API.
+                    enable_mkldnn=sys.platform != "darwin",
                     # Thread count — keep low to limit parallel memory use.
                     cpu_threads=2,
                 )
@@ -217,6 +219,9 @@ try:
     print("SymSpell dictionary loaded.")
 
     def _correct_text(text: str) -> str:
+        # The correction dictionary is English-only; preserve Tagalog words.
+        if _detect_lang(text) == "tl":
+            return text
         corrected_lines = []
         for line in text.splitlines():
             words = line.split()
@@ -250,10 +255,17 @@ except Exception as _e:
 
 # ── Language detection ────────────────────────────────────────────────────────
 try:
-    from langdetect import detect as _langdetect
+    from langdetect import DetectorFactory, PROFILES_DIRECTORY
+    _language_detector = DetectorFactory()
+    _language_detector.seed = 0
+    _language_detector.load_profile(PROFILES_DIRECTORY)
     def _detect_lang(text: str) -> str:
         try:
-            lang = _langdetect(text)
+            detector = _language_detector.create()
+            # This app supports two languages; unrestricted detection mislabels short Tagalog.
+            detector.set_prior_map({"en": 0.5, "tl": 0.5})
+            detector.append(text)
+            lang = detector.detect()
             return "tl" if lang in ("tl", "fil") else "en"
         except Exception:
             return "en"
@@ -365,7 +377,7 @@ async def run_ocr(req: OCRRequest):
 
 class TTSRequest(BaseModel):
     text: str
-    language: str = "tl"  # "tl" = Tagalog/Filipino, "en" = English
+    language: Literal["tl", "en"] = "tl"
 
 
 @app.post("/tts")
@@ -373,18 +385,16 @@ async def run_tts(req: TTSRequest):
     if not req.text.strip():
         raise HTTPException(status_code=400, detail="text is empty")
 
-    lang = req.language if req.language in ("tl", "en") else "tl"
-    voice = _TTS_VOICES[lang]
+    voice = _TTS_VOICES[req.language]
 
     try:
         import edge_tts
-        with tempfile.NamedTemporaryFile(suffix=".mp3", delete=False) as tmp:
-            tmp_path = tmp.name
-        communicate = edge_tts.Communicate(text=req.text, voice=voice)
-        await communicate.save(tmp_path)
-        with open(tmp_path, "rb") as f:
-            audio_bytes = f.read()
-        os.unlink(tmp_path)
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            tmp_path = os.path.join(tmp_dir, "speech.mp3")
+            communicate = edge_tts.Communicate(text=req.text, voice=voice)
+            await asyncio.wait_for(communicate.save(tmp_path), timeout=60)
+            with open(tmp_path, "rb") as f:
+                audio_bytes = f.read()
         return Response(content=audio_bytes, media_type="audio/mpeg")
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"TTS failed: {e}")
@@ -394,7 +404,8 @@ async def run_tts(req: TTSRequest):
 
 class TranslateRequest(BaseModel):
     text: str
-    source_lang: str = ""  # auto-detect if empty
+    source_lang: Literal["", "tl", "fil", "en"] = ""  # auto-detect if empty
+    target_lang: Literal["tl", "en"] | None = None
 
 
 class TranslateResponse(BaseModel):
@@ -403,13 +414,13 @@ class TranslateResponse(BaseModel):
     to_lang: str
 
 
-def _run_translate_blocking(text: str, forced_source: str) -> tuple[str, str, str]:
+def _run_translate_blocking(text: str, forced_source: str, target_lang: str | None = None) -> tuple[str, str, str]:
     import gc
     import re
 
     doc_source = forced_source or _detect_lang(text)
     doc_source = "tl" if doc_source in ("tl", "fil") else "en"
-    doc_target = "en" if doc_source == "tl" else "tl"
+    doc_target = target_lang or ("en" if doc_source == "tl" else "tl")
 
     sentences = [s.strip() for s in re.split(r"(?<=[.!?])\s+", text) if s.strip()]
     if not sentences:
@@ -424,21 +435,19 @@ def _run_translate_blocking(text: str, forced_source: str) -> tuple[str, str, st
         else:
             sent_source = _detect_lang(sent)
             sent_source = "tl" if sent_source in ("tl", "fil") else "en"
-        sent_target = "en" if sent_source == "tl" else "tl"
         if sent_source == doc_target:
             translated_parts.append(sent)
             continue
-        sent_direction = f"{sent_source}->{sent_target}"
+        sent_direction = f"{sent_source}->{doc_target}"
         try:
             out = _translate_ct2(sent, sent_direction)
         except Exception as e:
             print(f"[translate] sentence failed ({sent_direction}): {e!r} | {sent[:80]!r}")
-            out = ""
+            raise RuntimeError("Translation is unavailable. Please try again.") from e
         if out.strip():
             translated_parts.append(out)
         else:
-            print(f"[translate] empty output, keeping original: {sent[:80]!r}")
-            translated_parts.append(sent)
+            raise RuntimeError("Translation returned no text. Please try again.")
         gc.collect()
 
     return " ".join(translated_parts), doc_source, doc_target
@@ -452,7 +461,7 @@ async def translate_text(req: TranslateRequest):
     forced = req.source_lang.strip()
     try:
         translated, source, target = await asyncio.to_thread(
-            _run_translate_blocking, req.text, forced
+            _run_translate_blocking, req.text, forced, req.target_lang
         )
     except RuntimeError as e:
         raise HTTPException(status_code=503, detail=str(e))

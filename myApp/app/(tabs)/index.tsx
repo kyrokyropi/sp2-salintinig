@@ -31,7 +31,6 @@ import {
   createAlbum,
   createScan,
   getAlbums,
-  initDb,
 } from '@/components/db-service';
 import { useAccessibility } from '@/components/accessibility-context';
 import { Palette, Radius } from '@/constants/theme';
@@ -60,7 +59,6 @@ export default function ScannerScreen() {
   const [savingToAlbum, setSavingToAlbum] = useState(false);
   const cameraRef = useRef<CameraView>(null);
 
-  useEffect(() => { initDb(); }, []);
 
   // ── pulse animation (capture button) ────────────────────────────────────────
   const pulseAnim = useRef(new Animated.Value(1)).current;
@@ -274,8 +272,10 @@ export default function ScannerScreen() {
       setTtsLoading(language);
       const finalText = await translateTo(scannedText, language);
       router.push({ pathname: '/playback', params: { text: finalText, lang: language } });
-    } catch {
-      Alert.alert('May Error', 'Hindi naihanda ang audio. Siguraduhing tumatakbo ang backend server.');
+    } catch (error: unknown) {
+      const message = error instanceof Error ? error.message : 'Hindi naihanda ang audio.';
+      if (Platform.OS === 'web') window.alert(message);
+      else Alert.alert('May Error', message);
     } finally {
       setTtsLoading(null);
     }

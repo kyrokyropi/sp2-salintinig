@@ -7,6 +7,7 @@ import {
   ScrollView,
   ActivityIndicator,
   Alert,
+  Platform,
 } from 'react-native';
 import { SafeAreaView } from 'react-native-safe-area-context';
 import { useLocalSearchParams, router } from 'expo-router';
@@ -34,6 +35,10 @@ export default function PlaybackScreen() {
   // Load TTS audio once on mount
   useEffect(() => {
     let cancelled = false;
+    let loadedSound: Audio.Sound | null = null;
+    setStatus('loading');
+    setErrorMsg('');
+    audioUriRef.current = null;
 
     (async () => {
       try {
@@ -41,20 +46,33 @@ export default function PlaybackScreen() {
         const base64Audio = await fetchTTS(text ?? '', language);
         if (cancelled) return;
 
-        const uri = FileSystem.cacheDirectory + `tts_playback_${language}.mp3`;
-        await FileSystem.writeAsStringAsync(uri, base64Audio, {
-          encoding: FileSystem.EncodingType.Base64,
-        });
+        const uri = Platform.OS === 'web'
+          ? `data:audio/mpeg;base64,${base64Audio}`
+          : FileSystem.cacheDirectory + `tts_playback_${language}_${Date.now()}.mp3`;
+        if (Platform.OS !== 'web') {
+          await FileSystem.writeAsStringAsync(uri, base64Audio, {
+            encoding: FileSystem.EncodingType.Base64,
+          });
+        }
+        if (cancelled) return;
 
         audioUriRef.current = uri;
         const { sound } = await Audio.Sound.createAsync({ uri }, { shouldPlay: false });
+        loadedSound = sound;
         if (cancelled) {
-          sound.unloadAsync();
+          await sound.unloadAsync();
           return;
         }
 
         sound.setOnPlaybackStatusUpdate((s) => {
-          if (!s.isLoaded) return;
+          if (cancelled) return;
+          if (!s.isLoaded) {
+            if (s.error) {
+              setErrorMsg(s.error);
+              setStatus('error');
+            }
+            return;
+          }
           if (s.didJustFinish) setStatus('paused');
           else if (s.isPlaying) setStatus('playing');
           else setStatus('paused');
@@ -72,24 +90,29 @@ export default function PlaybackScreen() {
 
     return () => {
       cancelled = true;
-      soundRef.current?.unloadAsync();
+      void loadedSound?.unloadAsync();
       soundRef.current = null;
+      audioUriRef.current = null;
     };
-  // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []);
+  }, [text, language]);
 
   const togglePlayPause = async () => {
     const sound = soundRef.current;
     if (!sound) return;
 
-    if (status === 'playing') {
-      await sound.pauseAsync();
-    } else {
-      const s = await sound.getStatusAsync();
-      if (s.isLoaded && s.positionMillis >= (s.durationMillis ?? 0) - 200) {
-        await sound.setPositionAsync(0);
+    try {
+      if (status === 'playing') {
+        await sound.pauseAsync();
+      } else {
+        const s = await sound.getStatusAsync();
+        if (s.isLoaded && s.positionMillis >= (s.durationMillis ?? 0) - 200) {
+          await sound.setPositionAsync(0);
+        }
+        await sound.playAsync();
       }
-      await sound.playAsync();
+    } catch (e: unknown) {
+      setErrorMsg(e instanceof Error ? e.message : String(e));
+      setStatus('error');
     }
   };
 
@@ -100,6 +123,15 @@ export default function PlaybackScreen() {
     if (!src) return;
     try {
       setDownloading(true);
+      if (Platform.OS === 'web') {
+        const link = document.createElement('a');
+        link.href = src;
+        link.download = `salin_${language}_${Date.now()}.mp3`;
+        document.body.appendChild(link);
+        link.click();
+        link.remove();
+        return;
+      }
       const dest = FileSystem.documentDirectory + `salin_${language}_${Date.now()}.mp3`;
       await FileSystem.copyAsync({ from: src, to: dest });
       if (await Sharing.isAvailableAsync()) {
@@ -108,7 +140,9 @@ export default function PlaybackScreen() {
         Alert.alert('Nai-save', 'Nai-save ang audio sa mga dokumento ng app.');
       }
     } catch (e: unknown) {
-      Alert.alert('May Error', e instanceof Error ? e.message : 'Hindi na-save ang audio.');
+      const message = e instanceof Error ? e.message : 'Hindi na-save ang audio.';
+      if (Platform.OS === 'web') window.alert(message);
+      else Alert.alert('May Error', message);
     } finally {
       setDownloading(false);
     }

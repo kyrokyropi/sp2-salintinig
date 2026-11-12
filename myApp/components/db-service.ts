@@ -23,19 +23,24 @@ export type Scan = {
 // ─── db singleton ─────────────────────────────────────────────────────────────
 
 let _db: SQLite.SQLiteDatabase | null = null;
+let initialization: Promise<void> | null = null;
 
 function getDb(): SQLite.SQLiteDatabase {
   if (!_db) {
-    _db = SQLite.openDatabaseSync('salintinig.db');
+    throw new Error('Database is not initialized');
   }
   return _db;
 }
 
 // ─── init ─────────────────────────────────────────────────────────────────────
 
-export function initDb(): void {
-  const db = getDb();
-  db.execSync(`
+export function initDb(): Promise<void> {
+  return initialization ??= initializeDb();
+}
+
+async function initializeDb(): Promise<void> {
+  const db = await SQLite.openDatabaseAsync('salintinig.db');
+  await db.execAsync(`
     CREATE TABLE IF NOT EXISTS albums (
       id INTEGER PRIMARY KEY AUTOINCREMENT,
       name TEXT NOT NULL,
@@ -54,6 +59,7 @@ export function initDb(): void {
       created_at TEXT NOT NULL DEFAULT (datetime('now'))
     );
   `);
+  _db = db;
 }
 
 // ─── albums ───────────────────────────────────────────────────────────────────

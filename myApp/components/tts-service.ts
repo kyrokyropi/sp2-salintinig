@@ -1,4 +1,4 @@
-import { PADDLEOCR_URL } from './ocr-service';
+import { fetchWithTimeout, PADDLEOCR_URL } from './ocr-service';
 
 export type TTSLanguage = 'tl' | 'en';
 
@@ -7,14 +7,14 @@ export type TTSLanguage = 'tl' | 'en';
  * Returns a base64-encoded MP3 string ready for expo-av.
  */
 export async function fetchTTS(text: string, language: TTSLanguage): Promise<string> {
-  const response = await fetch(`${PADDLEOCR_URL}/tts`, {
+  const response = await fetchWithTimeout(`${PADDLEOCR_URL}/tts`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'ngrok-skip-browser-warning': 'true',
     },
     body: JSON.stringify({ text, language }),
-  });
+  }, 90_000);
 
   if (!response.ok) {
     const body = await response.text();
@@ -37,18 +37,18 @@ export type TranslateResult = {
 };
 
 /**
- * Auto-detects the language of `text` and translates it to the other language
- * (English ↔ Filipino). Returns the translated text plus source/target language codes.
+ * Auto-detects the source and translates to the requested language, or the other
+ * language when no target is supplied (English ↔ Filipino).
  */
-export async function translateText(text: string): Promise<TranslateResult> {
-  const response = await fetch(`${PADDLEOCR_URL}/translate`, {
+export async function translateText(text: string, targetLang?: TTSLanguage): Promise<TranslateResult> {
+  const response = await fetchWithTimeout(`${PADDLEOCR_URL}/translate`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'ngrok-skip-browser-warning': 'true',
     },
-    body: JSON.stringify({ text }),
-  });
+    body: JSON.stringify({ text, target_lang: targetLang }),
+  }, 120_000);
 
   if (!response.ok) {
     const body = await response.text();
@@ -63,9 +63,7 @@ export async function translateText(text: string): Promise<TranslateResult> {
  * If the text is already in `targetLang`, it is returned as-is.
  */
 export async function translateTo(text: string, targetLang: TTSLanguage): Promise<string> {
-  const srcLang = await detectLanguage(text);
-  if (srcLang === targetLang) return text;
-  const result = await translateText(text);
+  const result = await translateText(text, targetLang);
   return result.translated;
 }
 
@@ -73,14 +71,14 @@ export async function translateTo(text: string, targetLang: TTSLanguage): Promis
  * Detects whether `text` is English ('en') or Filipino/Tagalog ('tl').
  */
 export async function detectLanguage(text: string): Promise<TTSLanguage> {
-  const response = await fetch(`${PADDLEOCR_URL}/detect`, {
+  const response = await fetchWithTimeout(`${PADDLEOCR_URL}/detect`, {
     method: 'POST',
     headers: {
       'Content-Type': 'application/json',
       'ngrok-skip-browser-warning': 'true',
     },
     body: JSON.stringify({ text }),
-  });
+  }, 15_000);
 
   if (!response.ok) {
     const body = await response.text();

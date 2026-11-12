@@ -19,7 +19,6 @@ import {
   deleteAlbum,
   getAlbumScanCount,
   getAlbums,
-  initDb,
   renameAlbum,
 } from '@/components/db-service';
 import { useAccessibility } from '@/components/accessibility-context';
@@ -174,7 +173,6 @@ export default function HistoryScreen() {
   const [scanCounts, setScanCounts] = useState<Record<number, number>>({});
   const [nameModal, setNameModal] = useState<{ mode: 'create' | 'rename'; album?: Album } | null>(null);
 
-  useEffect(() => { initDb(); }, []);
 
   const loadAlbums = useCallback(() => {
     const list = getAlbums();

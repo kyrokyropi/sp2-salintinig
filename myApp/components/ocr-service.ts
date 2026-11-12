@@ -1,5 +1,4 @@
-export const PADDLEOCR_URL = "https://sp2-salintinig.onrender.com";
-
+export const PADDLEOCR_URL = "http://localhost:8000";
 const OCR_TIMEOUT_MS = 120_000;     // 2 minutes for OCR (large images)
 const CORRECT_TIMEOUT_MS = 60_000;  // 1 minute per correction chunk
 const CORRECT_CHUNK_SIZE = 500;     // characters per chunk sent to /correct
@@ -9,7 +8,7 @@ export type OCRResult = {
   confidence: number;
 };
 
-function fetchWithTimeout(
+export function fetchWithTimeout(
   url: string,
   options: RequestInit,
   timeoutMs: number,

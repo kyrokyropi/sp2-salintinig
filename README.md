@@ -70,6 +70,14 @@ npx expo start --tunnel
 ```
 Scan the QR code with Expo Go on your phone.
 
+For an iOS simulator on macOS, run `cd myApp && npm run ios` from the repository root.
+SDK 54's CLI gets a small Device Hub compatibility backport during `npm install`
+for Xcode 27. After pulling this fix with dependencies already installed, run
+`npm run postinstall` inside `myApp`, then restart Expo. Remove the postinstall
+backport when upgrading to an Expo CLI with built-in Device Hub support.
+Check the compatibility helper with `node --test scripts/expo-device-hub.test.cjs`
+inside `myApp`.
+
 ---
 
 ## Connecting the app to the server
